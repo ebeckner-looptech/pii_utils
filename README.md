@@ -155,5 +155,5 @@ This project is provided "as is" with no warranty. Use at your own risk.
 
 ## Contact
 
-For support or inquiries, reach out to [Your Team] at [Your Contact Information].
+For support or inquiries, reach out to Elliott Beckner at elliott.beckner@looptech.ai.
 
