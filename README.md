@@ -108,7 +108,7 @@ python pii_redact.py --tier S0 --batch-size 5 --redacted-output-file "local_reda
 
 ```python
 import asyncio
-from pii_obfuscation_utils import PIIObfuscationUtility
+from pii_obfuscate import PIIObfuscationUtility
 
 async def example_run():
     utility = PIIObfuscationUtility(
