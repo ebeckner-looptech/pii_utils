@@ -24,8 +24,8 @@ DEFAULT_COSMOS_DB_KEY = "<your-cosmos-db-key>"
 # Cosmos DB Database and Container Names
 # ---------------------------
 DATABASE_NAME = "YourDatabaseName"
-MESSAGES_CONTAINER_NAME = "Messages"             # Source messages container
-LEDGER_CONTAINER_NAME = "ProcessingLedger"         # Processing ledger container
+MESSAGES_CONTAINER_NAME = "Messages"             # Source messages container (raw data, unchanged)
+LEDGER_CONTAINER_NAME = "ProcessingLedger"         # Processing ledger container (tracks processed messages)
 OUTPUT_CONTAINER_NAME = "CleanedMessages"          # Destination container for redacted messages
 
 # ---------------------------
@@ -62,6 +62,9 @@ async def update_cosmos_container(container, items):
     await asyncio.gather(*tasks)
 
 async def log_processed_messages(ledger_container, processed_messages):
+    """
+    Log processed messages in the ledger container using a composite key of conversationId and messageId.
+    """
     timestamp = datetime.utcnow().isoformat()
     tasks = []
     for msg in processed_messages:
@@ -99,6 +102,55 @@ def write_failed_metadata(failed_messages, failed_file):
         logger.info(f"Failed message metadata written to CSV: {failed_file}")
     except Exception as e:
         logger.error(f"Failed to write failed messages metadata: {e}")
+
+# ---------------------------
+# Query and Filtering Functions
+# ---------------------------
+async def query_all_messages(messages_container):
+    """
+    Query all messages from the source container.
+    """
+    query = "SELECT * FROM c"
+    messages_iterator = messages_container.query_items(query, enable_cross_partition_query=True)
+    messages = [msg async for msg in messages_iterator]
+    return messages
+
+async def get_processed_message_ids(ledger_container):
+    """
+    Retrieve the set of processed message composite keys (conversationId_messageId) from the ledger.
+    """
+    processed_ids = set()
+    query = "SELECT c.conversationId, c.messageId FROM c"
+    async for record in ledger_container.query_items(query, enable_cross_partition_query=True):
+        key = f"{record.get('conversationId')}_{record.get('messageId')}"
+        processed_ids.add(key)
+    return processed_ids
+
+async def filter_unprocessed_messages(messages, ledger_container):
+    """
+    Given a list of messages, filter out those that have already been processed by consulting the ledger.
+    """
+    processed_ids = await get_processed_message_ids(ledger_container)
+    unprocessed = []
+    for msg in messages:
+        key = f"{msg.get('conversationId')}_{msg.get('id')}"
+        if key not in processed_ids:
+            unprocessed.append(msg)
+    return unprocessed
+
+async def display_overall_progress(messages_container, ledger_container):
+    """
+    Display overall progress by comparing the total messages to the number of processed messages (from the ledger).
+    """
+    total_query = "SELECT VALUE COUNT(1) FROM c"
+    async for count in messages_container.query_items(total_query, enable_cross_partition_query=True):
+        total_items = count
+    processed_ids = await get_processed_message_ids(ledger_container)
+    processed_items = len(processed_ids)
+    remaining = total_items - processed_items
+    percentage = (processed_items / total_items * 100) if total_items > 0 else 0
+    logger.info(f"Overall Progress: {processed_items}/{total_items} messages processed ({percentage:.2f}%). {remaining} remaining.")
+    return total_items, processed_items, remaining
 
 # ---------------------------
 # Asynchronous Batch Processing Functions
@@ -142,7 +194,6 @@ async def process_all_batches(messages, ta_client, max_concurrent_batches, batch
     """
     semaphore = asyncio.Semaphore(max_concurrent_batches)
     tasks = []
-    num_batches = math.ceil(len(messages) / batch_size)
     for i in range(0, len(messages), batch_size):
         batch = messages[i:i+batch_size]
         tasks.append(process_batch(batch, ta_client, semaphore))
@@ -161,29 +212,6 @@ async def process_all_batches(messages, ta_client, max_concurrent_batches, batch
     return successful_all, failed_all
 
 # ---------------------------
-# Query and Progress Functions
-# ---------------------------
-async def query_unprocessed_messages(messages_container):
-    query = "SELECT * FROM c WHERE NOT IS_DEFINED(c.piiProcessed) OR c.piiProcessed = false"
-    messages_iterator = messages_container.query_items(query, enable_cross_partition_query=True)
-    messages = [msg async for msg in messages_iterator]
-    return messages
-
-async def display_overall_progress(messages_container):
-    total_query = "SELECT VALUE COUNT(1) FROM c"
-    processed_query = "SELECT VALUE COUNT(1) FROM c WHERE IS_DEFINED(c.piiProcessed) AND c.piiProcessed = true"
-    total_items = 0
-    processed_items = 0
-    async for count in messages_container.query_items(total_query, enable_cross_partition_query=True):
-        total_items = count
-    async for count in messages_container.query_items(processed_query, enable_cross_partition_query=True):
-        processed_items = count
-    remaining = total_items - processed_items
-    percentage = (processed_items / total_items * 100) if total_items > 0 else 0
-    logger.info(f"Overall Progress: {processed_items}/{total_items} messages processed ({percentage:.2f}%). {remaining} remaining.")
-    return total_items, processed_items, remaining
-
-# ---------------------------
 # MVP1: Redaction-Only Processing with Cloud/Local Options
 # ---------------------------
 async def mvp1_redaction(args):
@@ -191,7 +219,7 @@ async def mvp1_redaction(args):
     batch_size = args.batch_size
     max_concurrent_batches = TIER_CONCURRENCY_LIMITS.get(tier, 5)
     logger.info(f"Tier: '{tier}' with up to {max_concurrent_batches} concurrent batches and batch size {batch_size}.")
-    
+
     # Determine whether to run in cloud mode.
     cloud_mode = args.cloud_mode
 
@@ -215,11 +243,13 @@ async def mvp1_redaction(args):
     if cloud_mode:
         output_container = database.get_container_client(OUTPUT_CONTAINER_NAME)
 
-    # Display overall progress.
-    await display_overall_progress(messages_container)
+    # Display overall progress before starting.
+    await display_overall_progress(messages_container, ledger_container)
 
-    # Query unprocessed messages.
-    messages_to_process = await query_unprocessed_messages(messages_container)
+    # Query all messages from the source.
+    all_messages = await query_all_messages(messages_container)
+    # Filter out already processed messages using the ledger.
+    messages_to_process = await filter_unprocessed_messages(all_messages, ledger_container)
     if not messages_to_process:
         logger.info("No unprocessed messages found. Exiting.")
         await ta_client.close()
@@ -229,10 +259,6 @@ async def mvp1_redaction(args):
     logger.info(f"{len(messages_to_process)} unprocessed messages found.")
     successful_msgs, failed_msgs = await process_all_batches(messages_to_process, ta_client, max_concurrent_batches, batch_size)
     logger.info(f"Batch processing complete: {len(successful_msgs)} messages processed successfully; {len(failed_msgs)} failed in this run.")
-
-    # Mark successful messages as processed.
-    for msg in successful_msgs:
-        msg["piiProcessed"] = True
 
     # Output results:
     if cloud_mode:
@@ -256,14 +282,14 @@ async def mvp1_redaction(args):
 
     await ta_client.close()
     await cosmos_client.close()
-    await display_overall_progress(messages_container)
+    await display_overall_progress(messages_container, ledger_container)
     logger.info("Processing complete.")
 
 # ---------------------------
 # Main Entry Point with Argparse
 # ---------------------------
 def main():
-    parser = argparse.ArgumentParser(description="MVP1 Redaction-Only Processing Script")
+    parser = argparse.ArgumentParser(description="MVP1 Redaction-Only Processing Script (Ledger-Only Tracking)")
     parser.add_argument("--tier", type=str, default="S0", choices=["S", "S0", "F0"],
                         help="Azure service tier (affects throughput throttling)")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
